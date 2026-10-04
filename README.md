@@ -15,13 +15,14 @@ Currently, Leetify focuses on the core workflow. Additional features such as REA
 - Detects when you click the **Submit** button on LeetCode.
 - Identifies the current problem directly from the LeetCode URL.
 - Fetches problem metadata using LeetCode GraphQL.
-- Temporarily caches problem information using `chrome.storage.session`.
+- Caches problem information in memory for the lifetime of the page, with automatic retry if a lookup fails.
+- Detects the new submission by comparing submission IDs, so it does not depend on your system clock.
 - Waits for LeetCode to finish processing the submission.
 - Detects whether the submission was accepted.
 - Retrieves the submitted source code and programming language.
 - Automatically pushes the solution to GitHub.
 - Supports multiple programming languages.
-- Organizes solutions into separate folders for Daily and Random problems.
+- Organizes solutions into separate folders for Daily and Random problems, decided at the moment you submit.
 
 ---
 
@@ -55,6 +56,12 @@ For example:
 Leetcode Daily/678-valid-parenthesis-string/solution.cpp
 ```
 
+### How Daily vs Random is decided
+
+A solution goes into `Leetcode Daily/` when the problem page URL contains `envType=daily-question`, which is the case when you open the problem through LeetCode's daily challenge link. Otherwise it goes into `Random Problems/`.
+
+This is checked when you click Submit, not when the problem is first loaded, so opening the same problem both ways is handled correctly.
+
 ---
 
 ## 🧱 Project Structure
@@ -83,33 +90,52 @@ Leetify/
 └── manifest.json
 ```
 
+### Content script load order
+
+The content scripts share functions as globals, so the order in `manifest.json` matters. `problemDetails.js` and `solutionGetter.js` must be listed **before** `submissionChecker.js`:
+
+```json
+"content_scripts": [
+  {
+    "matches": ["https://leetcode.com/*"],
+    "js": [
+      "content/problemDetails.js",
+      "content/solutionGetter.js",
+      "content/submissionChecker.js"
+    ]
+  }
+]
+```
+
 ### `problemDetails.js`
 
 Responsible for:
 
-- Extracting the problem slug from the current URL.
-- Fetching problem details from LeetCode GraphQL.
-- Caching problem details in `chrome.storage.session`.
+- Extracting the problem slug from the current URL (`getSlug`).
+- Fetching problem details from LeetCode GraphQL (`getProblem`).
+- Caching problem details in memory, retrying on the next call if a fetch fails.
+- Detecting whether the page was opened through the daily challenge (`isDailyChallenge`).
 
-The current cached information includes:
+The cached information includes:
 
 ```text
 number
 problem
 slug
 difficulty
-isDaily
 ```
+
+`isDaily` is not cached. It is calculated at submit time.
 
 ### `submissionChecker.js`
 
 Responsible for:
 
-- Detecting the LeetCode Submit button.
-- Finding the latest submission for the current problem.
-- Waiting for the submission to reach a final state.
+- Detecting clicks on the LeetCode Submit button.
+- Recording the newest existing submission before you submit, to use as a baseline.
+- Polling for a new submission (a different ID than the baseline) until it reaches a final state.
 - Checking whether the submission was accepted.
-- Passing the accepted solution to the background service worker.
+- Building the solution object and passing it to the background service worker.
 
 ### `solutionGetter.js`
 
@@ -270,9 +296,11 @@ Write your solution normally.
 
 ### 3. Click Submit
 
-Leetify detects the Submit button.
+Leetify detects the Submit button and notes the latest existing submission for the problem.
 
-It then checks LeetCode for the newly created submission.
+It then polls LeetCode until a new submission appears and finishes processing.
+
+> Only clicking the **Submit** button is detected. Keyboard shortcuts are not.
 
 ### 4. If the submission is accepted
 
@@ -294,13 +322,13 @@ or:
 Random Problems/1-two-sum/solution.cpp
 ```
 
-depending on the problem category.
+depending on how you opened the problem.
+
+If a solution for the same problem and language already exists, it is updated in place.
 
 ---
 
 # 🔐 Storage
-
-Leetify uses two different types of Chrome storage.
 
 ## `chrome.storage.local`
 
@@ -312,27 +340,22 @@ githubRepo
 githubToken
 ```
 
-## `chrome.storage.session`
+## In-memory problem cache
 
-Used for temporary LeetCode problem information.
-
-Example:
+Problem information fetched from LeetCode is kept in a `Map` inside the content script, keyed by problem slug:
 
 ```js
 {
-    problems: {
-        "two-sum": {
-            number: 1,
-            problem: "Two Sum",
-            slug: "two-sum",
-            difficulty: "Easy",
-            isDaily: false
-        }
+    "two-sum": {
+        number: 1,
+        problem: "Two Sum",
+        slug: "two-sum",
+        difficulty: "Easy"
     }
 }
 ```
 
-Problem information is not intended to be permanently stored in local extension storage.
+This cache lives only as long as the LeetCode tab, so nothing about problems is written to Chrome storage and nothing appears under **Application → Extension storage** in DevTools.
 
 ---
 
@@ -351,7 +374,7 @@ Problem information is not intended to be permanently stored in local extension 
             GraphQL request
                     │
                     ▼
-           Session cache
+            In-memory cache
                     │
                     │
              User clicks
@@ -361,7 +384,11 @@ Problem information is not intended to be permanently stored in local extension 
         submissionChecker.js
                     │
                     ▼
-          Latest submission
+      Record baseline submission ID
+                    │
+                    ▼
+     Poll until a new submission
+          reaches a final state
                     │
                     ▼
               Accepted?
@@ -406,8 +433,10 @@ Open LeetCode → `F12` → **Console**
 You should see logs such as:
 
 ```text
-[Leetify] Problem cached: ...
 [Leetify] Submission checker started
+[Leetify] Fetching problem: ...
+[Leetify] ✅ Problem cached: ...
+[Leetify] Baseline submission id: ...
 [Leetify] 🚀 Submission detected: ...
 [Leetify] ✅ Solution: ...
 ```
@@ -426,6 +455,28 @@ Then open:
 Service worker → Inspect
 ```
 
+You should see:
+
+```text
+[Leetify] 🚀 Pushed to GitHub
+```
+
+or a `GitHub upload failed` error with a status code.
+
+---
+
+# 🩺 Troubleshooting
+
+| Symptom | Things to check |
+|---|---|
+| No `Submission checker started` log | Content scripts aren't loading. Check `matches` in `manifest.json`, then reload the extension and the LeetCode tab. |
+| `ReferenceError: getSlug is not defined` (or `getProblem`, `getSolution`) | Wrong script order in `manifest.json`. See [Content script load order](#content-script-load-order). |
+| `Submission detected` appears but nothing is pushed | Look for a `❌ Error` line in the page console (for example "Submission not found"), then check the service worker console. |
+| `GitHub is not configured` | Open the popup and save the owner, repository and token. |
+| `GitHub upload failed: 401` / `403` / `404` | Token is invalid, lacks contents read/write permission, or the owner/repository is wrong. |
+| Wrong folder (Daily vs Random) | Open the problem through the daily challenge link so the URL contains `envType=daily-question`. |
+| Not logged in | Leetify needs an active LeetCode session to read your submissions. |
+
 ---
 
 # 🌱 Future Improvements
@@ -442,9 +493,9 @@ Potential future features:
 - Detect and explain similar previously solved problems.
 - AI-generated solution explanations.
 - AI-generated approach and reasoning.
-- Better SPA navigation handling.
+- Detect submissions made with keyboard shortcuts.
 - Support additional GitHub repository configurations.
-- Improve duplicate/update handling.
+- Improve duplicate/update handling (for example, "Update" commit messages and richer error details).
 - Add a richer extension popup/dashboard.
 
 The architecture is intentionally separated so these features can be added without rewriting the core submission flow.
