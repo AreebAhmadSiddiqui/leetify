@@ -1,3 +1,11 @@
+// NOTE: In manifest.json, list this file BEFORE submissionChecker.js
+// (and solutionGetter.js) in content_scripts.js, because they share
+// these globals: getSlug, getProblem, isDailyChallenge.
+
+// In-memory cache: slug -> Promise<problem | null>.
+// Storing the promise also dedupes concurrent requests for the same slug.
+const problemCache = new Map();
+
 // Get the problem slug from the current LeetCode URL
 function getSlug() {
   const parts = location.pathname.split("/").filter(Boolean);
@@ -10,25 +18,19 @@ function getSlug() {
   return parts[1] || null;
 }
 
-// Fetch problem details from LeetCode GraphQL
-// and store them in session storage
-async function getProblem(slug) {
-  // First check if we already have this problem cached
-  const result = await chrome.storage.session.get("problems");
+// Whether the user reached this problem through the daily challenge.
+// Evaluated at submit time (not cached), because the same problem can
+// be opened both normally and via the daily link.
+function isDailyChallenge() {
+  return (
+    new URLSearchParams(location.search).get("envType") === "daily-question"
+  );
+}
 
-  const problems = result.problems || {};
-
-  // If problem already exists in cache,
-  // there is no need to make another GraphQL request
-  if (problems[slug]) {
-    console.log("[Leetify] Problem already cached:", slug);
-
-    return problems[slug];
-  }
-
+// Fetch basic problem details from the LeetCode GraphQL API
+async function fetchProblem(slug) {
   console.log("[Leetify] Fetching problem:", slug);
 
-  // GraphQL query to get basic problem information
   const query = {
     operationName: "questionData",
 
@@ -37,115 +39,74 @@ async function getProblem(slug) {
     },
 
     query: `
-        query questionData($titleSlug: String!) {
-            question(titleSlug: $titleSlug) {
-                questionFrontendId
-                title
-                titleSlug
-                difficulty
-
-                content
-
-                exampleTestcases
-
-                topicTags {
-                    name
-                    slug
-                }
-
-                hints
-
-                isPaidOnly
-            }
+      query questionData($titleSlug: String!) {
+        question(titleSlug: $titleSlug) {
+          questionFrontendId
+          title
+          titleSlug
+          difficulty
         }
+      }
     `,
   };
 
-  // Send request to LeetCode
   const response = await fetch("https://leetcode.com/graphql/", {
     method: "POST",
-
     credentials: "include",
-
     headers: {
       "Content-Type": "application/json",
     },
-
     body: JSON.stringify(query),
   });
 
-  const data = await response.json();
-
-  const question = data?.data?.question;
-
-  // Stop if LeetCode did not return a problem
-  if (!question) {
-    console.error("[Leetify] Could not fetch problem:", slug);
-
-    return null;
+  if (!response.ok) {
+    throw new Error(`LeetCode responded with ${response.status}`);
   }
 
-  // Create the object that we want to keep in cache
+  const data = await response.json();
+  const question = data?.data?.question;
+
+  if (!question) {
+    throw new Error("LeetCode did not return a problem");
+  }
+
   const problem = {
     number: Number(question.questionFrontendId),
-
     problem: question.title,
-
     slug: question.titleSlug,
-
     difficulty: question.difficulty,
-
-    isDaily:
-      new URLSearchParams(location.search).get("envType") === "daily-question",
   };
-
-  // Store the problem using its slug as the key
-  problems[slug] = problem;
-
-  // Save the updated problem cache
-  await chrome.storage.session.set({
-    problems,
-  });
 
   console.log("[Leetify] ✅ Problem cached:", problem);
 
   return problem;
 }
 
-// Keep track of the last URL/slug that we processed
-let lastSlug = null;
-
-// Check the current URL and make sure
-// the problem is present in the cache
-async function checkProblem() {
-  const slug = getSlug();
-
-  // Not a problem page
-  if (!slug) {
-    return;
+// Get a problem, using the cache when possible.
+// Failed lookups are removed from the cache so the next call retries.
+function getProblem(slug) {
+  if (problemCache.has(slug)) {
+    return problemCache.get(slug);
   }
 
-  // We already processed this problem
-  // and don't need to check again
-  if (slug === lastSlug) {
-    return;
-  }
+  const request = fetchProblem(slug).catch((error) => {
+    console.error("[Leetify] Could not fetch problem:", slug, error);
+    problemCache.delete(slug);
+    return null;
+  });
 
-  lastSlug = slug;
+  problemCache.set(slug, request);
 
-  // Fetch the problem only if it isn't
-  // already present in session storage
-  await getProblem(slug);
+  return request;
 }
 
-// Initial check when the content script starts
-checkProblem();
+// Warm the cache for the page we landed on.
+// No polling needed: submissionChecker calls getProblem(slug) at submit
+// time, which hits the cache or fetches (and retries) if needed.
+{
+  const slug = getSlug();
 
-// LeetCode uses client-side navigation,
-// so the content script does not necessarily
-// reload when the URL changes.
-//
-// We periodically check the URL so that
-// navigating between problems/sub-pages
-// is handled automatically.
-setInterval(checkProblem, 500);
+  if (slug) {
+    getProblem(slug);
+  }
+}

@@ -203,5 +203,4 @@ class GitHubService {
 }
 
 
-const githubService =
-    new GitHubService();
+const githubService = new GitHubService();
